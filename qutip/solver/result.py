@@ -87,6 +87,10 @@ class _BaseResult:
         self._state_processors = []
         self._state_processors_require_copy = False
 
+        # Bound solver query used by :meth:`query`. Stays ``None`` unless the
+        # solver recorded a dense output during the evolution.
+        self._dense_query = None
+
         # make sure not to store a reference to the solver
         self.options = options.copy()
         # Almost all integrators already return a copy that is safe to use.
@@ -128,6 +132,15 @@ class _BaseResult:
         """
         self._state_processors.append(f)
         self._state_processors_require_copy |= requires_copy
+
+    def attach_dense_query(self, query):
+        """
+        Attach the solver's dense-output query function so that
+        :meth:`Result.query` can recover states at times not present in
+        ``tlist``. Should only be called by the solver when a dense output
+        was recorded.
+        """
+        self._dense_query = query
 
 
 class ResultOptions(TypedDict):
@@ -337,6 +350,59 @@ class Result(_BaseResult):
 
         for op in self._state_processors:
             op(t, state)
+
+    def query(self, t: float):
+        """
+        Recover the state and expectation values at time ``t`` from the
+        dense output recorded by the solver.
+
+        The state is interpolated from the integrator's dense-output
+        polynomial without evolving the system again and without affecting
+        the solver's subsequent evolution. It is identical to the result
+        that would have been obtained had ``t`` been included in the
+        original ``tlist``.
+
+        Parameters
+        ----------
+        t : float
+            Time at which to recover the state. It must lie within the time
+            interval covered by the evolution.
+
+        Returns
+        -------
+        state : :obj:`.Qobj`
+            The state of the system at time ``t``. Returned directly when no
+            expectation operators were supplied.
+
+        (state, expect) : tuple
+            If ``e_ops`` were supplied, returns the state together with a
+            dictionary containing the expectation value of each ``e_op`` at
+            ``t``, keyed like :attr:`e_data`.
+
+        Raises
+        ------
+        RuntimeError
+            If the evolution did not record a dense output. Rerun the solver
+            with the ``store_dense_output`` option enabled (supported by the
+            ``"vern7"``, ``"vern9"`` and ``"tsit5"`` integrators).
+        """
+        if self._dense_query is None:
+            raise RuntimeError(
+                "No dense output was stored for this result. Rerun the "
+                "solver with the 'store_dense_output' option enabled "
+                "(supported by the 'vern7', 'vern9' and 'tsit5' "
+                "integrators)."
+            )
+        if t < self.times[0] or t > self.times[-1]:
+            raise ValueError(
+                f"`t`={t} is outside the evolved output interval "
+                f"[{self.times[0]}, {self.times[-1]}]."
+            )
+        state = self._dense_query(t)
+        if not self.e_ops:
+            return state
+        expect = {key: e_op(t, state) for key, e_op in self.e_ops.items()}
+        return state, expect
 
     def __repr__(self):
         lines = [

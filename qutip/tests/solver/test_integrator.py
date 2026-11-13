@@ -337,3 +337,180 @@ def test_rk_options(integrator):
         expected = pytest.approx(np.exp(t), abs=1e-5)
         result1 = inter.integrate(t)[1].to_array()[0, 0]
         assert result1 == expected
+
+
+def _rk_dense_system():
+    # psi(t) = exp(-i pi sigmax t) |0>
+    system = qutip.QobjEvo(-1j * qutip.sigmax() * np.pi)
+    psi0 = qutip.basis(2, 0).data
+
+    def analytical(t):
+        return (
+            qutip.Qobj(-1j * qutip.sigmax() * np.pi * t).expm()
+            @ qutip.basis(2, 0)
+        ).full()
+
+    return system, psi0, analytical
+
+
+@pytest.mark.parametrize('integrator',
+    [IntegratorVern7, IntegratorVern9, IntegratorTsit5],
+    ids=["vern7", 'vern9', 'tsit5']
+)
+class TestRKDenseOutput:
+    def _make(self, integrator, extra_options=None):
+        system, psi0, analytical = _rk_dense_system()
+        options = {
+            'atol': 1e-11, 'rtol': 1e-11,
+            'store_dense_output': True,
+        }
+        if extra_options:
+            options.update(extra_options)
+        inter = integrator(system.matmul_data, options)
+        inter.set_state(0, psi0)
+        return inter, analytical
+
+    def test_dense_interpolate_matches_analytical(self, integrator):
+        inter, analytical = self._make(integrator)
+        tlist = np.linspace(0, 1, 6)
+        list(inter.run(tlist))
+
+        query_times = [
+            tlist[0], tlist[-1],
+            0.5 * (tlist[1] + tlist[2]),
+            0.237, 0.581, 0.913,
+        ]
+        for t in query_times:
+            t_got, state = inter.dense_interpolate(t)
+            assert t_got == t
+            assert_allclose(state.to_array(), analytical(t), atol=1e-8)
+
+    def test_dense_interpolate_matches_inserted_tlist(self, integrator):
+        # The queried state must be identical to having the time in tlist.
+        t_star = 0.413
+        tlist = np.linspace(0, 1, 6)
+
+        inter, _ = self._make(integrator)
+        list(inter.run(tlist))
+        _, queried = inter.dense_interpolate(t_star)
+
+        system, psi0, _ = _rk_dense_system()
+        reference = integrator(
+            system.matmul_data,
+            {'atol': 1e-11, 'rtol': 1e-11, 'store_dense_output': True},
+        )
+        reference.set_state(0, psi0)
+        list(reference.run(sorted([*tlist, t_star])))
+        _, direct = reference.dense_interpolate(t_star)
+
+        assert_allclose(
+            queried.to_array(), direct.to_array(), atol=1e-13, rtol=0
+        )
+
+    def test_interpolate_is_non_destructive(self, integrator):
+        inter, analytical = self._make(integrator)
+        inter.integrate(0.7)
+        t_before, state_before = inter.get_state(copy=True)
+
+        # Query inside the step currently held by the integrator; the
+        # integrator state must not move.
+        ode = inter._ode_solver
+        t_query = 0.5 * (ode.t_prev + min(0.7, ode.t_front))
+        t_got, queried = inter.interpolate(t_query)
+        assert t_got == t_query
+        assert_allclose(queried.to_array(), analytical(t_query), atol=1e-8)
+        t_after, state_after = inter.get_state(copy=True)
+        assert t_after == t_before
+        assert_allclose(
+            state_after.to_array(), state_before.to_array(), rtol=0, atol=0
+        )
+
+        # Continuing the evolution must match an integrator without queries.
+        system, psi0, _ = _rk_dense_system()
+        reference = integrator(
+            system.matmul_data, {'atol': 1e-11, 'rtol': 1e-11}
+        )
+        reference.set_state(0, psi0)
+        reference.integrate(0.7)
+        for t in [0.8, 0.9, 1.1]:
+            _, ref_state = reference.integrate(t)
+            _, state = inter.integrate(t)
+            assert_allclose(
+                state.to_array(), ref_state.to_array(), rtol=0, atol=0
+            )
+
+    def test_dense_interpolate_is_non_destructive(self, integrator):
+        inter, _ = self._make(integrator)
+        tlist = np.linspace(0, 1, 6)
+        list(inter.run(tlist))
+
+        system, psi0, analytical = _rk_dense_system()
+        reference = integrator(
+            system.matmul_data,
+            {'atol': 1e-11, 'rtol': 1e-11, 'store_dense_output': True},
+        )
+        reference.set_state(0, psi0)
+        list(reference.run(tlist))
+
+        for t in [0.137, 0.482, 0.836]:
+            inter.dense_interpolate(t)
+        # The integration state and the continuation are untouched.
+        assert inter.get_state()[0] == reference.get_state()[0]
+        for t in [1.1, 1.3]:
+            _, state = inter.integrate(t)
+            _, ref_state = reference.integrate(t)
+            assert_allclose(
+                state.to_array(), ref_state.to_array(), rtol=0, atol=0
+            )
+
+    def test_dense_interpolate_range_errors(self, integrator):
+        inter, _ = self._make(integrator)
+        list(inter.run(np.linspace(0, 1, 6)))
+
+        with pytest.raises(ValueError):
+            inter.dense_interpolate(-0.1)
+        with pytest.raises(ValueError):
+            inter.dense_interpolate(5.0)
+
+        t_front = inter._ode_solver.t_front
+        t_prev = inter._ode_solver.t_prev
+        with pytest.raises(ValueError):
+            inter.interpolate(t_prev - 0.01)
+        with pytest.raises(ValueError):
+            inter.interpolate(t_front + 0.01)
+        # Endpoints of the current step are valid queries.
+        inter.interpolate(t_prev)
+        inter.interpolate(t_front)
+
+    def test_dense_output_disabled(self, integrator):
+        system, psi0, _ = _rk_dense_system()
+        inter = integrator(
+            system.matmul_data,
+            {'atol': 1e-11, 'rtol': 1e-11, 'store_dense_output': False},
+        )
+        inter.set_state(0, psi0)
+        list(inter.run(np.linspace(0, 1, 6)))
+        with pytest.raises(ValueError):
+            inter.dense_interpolate(0.5)
+
+    def test_store_dense_output_requires_interpolation(self, integrator):
+        system, psi0, _ = _rk_dense_system()
+        with pytest.raises(ValueError):
+            integrator(
+                system.matmul_data,
+                {
+                    'atol': 1e-11, 'rtol': 1e-11,
+                    'interpolate': False,
+                    'store_dense_output': True,
+                },
+            )
+
+
+def test_dense_output_unsupported_integrator():
+    system = qutip.QobjEvo(0.5 * qutip.qeye(1))
+    inter = IntegratorScipyAdams(system.matmul_data, {})
+    inter.set_state(0, qutip.basis(1, 0).data)
+    with pytest.raises(IntegratorException):
+        inter.interpolate(0.1)
+    with pytest.raises(IntegratorException):
+        inter.dense_interpolate(0.1)

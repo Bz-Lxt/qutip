@@ -56,6 +56,7 @@ class IntegratorVern7(Integrator):
         'max_step': 0,
         'min_step': 0,
         'interpolate': True,
+        'store_dense_output': False,
     }
     tableau = vern7_coeff
 
@@ -85,6 +86,35 @@ class IntegratorVern7(Integrator):
         self._ode_solver.integrate(t, step=True)
         self._check_failed_integration()
         return self.get_state(copy)
+
+    def interpolate(
+        self, t: float, copy: bool = True
+    ) -> tuple[float, _data.Data]:
+        """
+        Interpolate the state at time ``t`` within the most recent internal
+        integration step using the method's dense output.
+
+        The integrator's state is left unchanged, so this query does not
+        affect the continuous progression of subsequent :meth:`integrate`
+        or :meth:`mcstep` calls.
+        """
+        state = self._ode_solver.interpolate_state(t)
+        return t, state.copy() if copy else state
+
+    def dense_interpolate(
+        self, t: float, copy: bool = True
+    ) -> tuple[float, _data.Data]:
+        """
+        Recover the state at time ``t`` from the dense-output polynomials
+        recorded during the whole evolution when the
+        ``store_dense_output`` option is enabled.
+
+        No evolution is performed and the integrator's state is left
+        unchanged, so subsequent :meth:`integrate` or :meth:`mcstep` calls
+        proceed exactly as without the query.
+        """
+        state = self._ode_solver.dense_interpolate(t)
+        return t, state.copy() if copy else state
 
     def _check_failed_integration(self):
         if self._ode_solver.successful():
@@ -118,6 +148,12 @@ class IntegratorVern7(Integrator):
 
         interpolate : bool, default: True
             Whether to use interpolation step, faster most of the time.
+
+        store_dense_output : bool, default: False
+            Whether to record the dense-output polynomial of every accepted
+            step. When enabled, ``dense_interpolate`` (and the ``query``
+            method of the solver and its result) can recover the state at any
+            time covered by the evolution without evolving the system again.
         """
         return self._options
 
@@ -149,6 +185,7 @@ class IntegratorVern9(IntegratorVern7):
         'max_step': 0,
         'min_step': 0,
         'interpolate': True,
+        'store_dense_output': False,
     }
     tableau = vern9_coeff
 
@@ -177,6 +214,7 @@ class IntegratorTsit5(IntegratorVern7):
         'max_step': 0,
         'min_step': 0,
         'interpolate': True,
+        'store_dense_output': False,
     }
     tableau = tsit5_coeff
 

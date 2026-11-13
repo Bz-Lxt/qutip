@@ -1086,3 +1086,90 @@ def test_mesolve_caches_isherm_for_ishp_superoperator():
 
     assert result.final_state._isherm is True
     assert result.final_state.isherm is True
+
+
+@pytest.mark.parametrize("method", ["vern7", "vern9"])
+class TestMESolverDenseOutput:
+    H = qutip.sigmaz()
+    c_ops = [0.3 * qutip.sigmam()]
+    rho0 = qutip.ket2dm(qutip.basis(2, 0))
+    e_ops = [qutip.sigmaz(), qutip.sigmax()]
+    tlist = np.linspace(0, 2, 7)
+    query_times = [0.214, 0.739, 1.402, 1.876]
+
+    def _options(self, method):
+        return {
+            "method": method,
+            "store_dense_output": True,
+            "atol": 1e-11,
+            "rtol": 1e-11,
+            "progress_bar": None,
+        }
+
+    def test_query_matches_inserted_tlist(self, method):
+        solver = MESolver(
+            self.H, c_ops=self.c_ops, options=self._options(method)
+        )
+        result = solver.run(self.rho0, self.tlist, e_ops=self.e_ops)
+
+        for t in self.query_times:
+            state, expect = result.query(t)
+            direct = mesolve(
+                self.H, self.rho0, sorted([*self.tlist, t]),
+                c_ops=self.c_ops, e_ops=self.e_ops,
+                options={
+                    "method": method, "atol": 1e-11, "rtol": 1e-11,
+                    "store_states": True, "progress_bar": None,
+                },
+            )
+            idx = list(direct.times).index(t)
+            np.testing.assert_allclose(
+                state.full(), direct.states[idx].full(), atol=1e-12, rtol=0
+            )
+            for i in range(len(self.e_ops)):
+                np.testing.assert_allclose(
+                    expect[i], direct.expect[i][idx], atol=1e-12, rtol=0
+                )
+
+    def test_query_does_not_affect_subsequent_step(self, method):
+        options = self._options(method)
+        solver_ref = MESolver(
+            self.H, c_ops=self.c_ops, options=options
+        )
+        solver_ref.start(self.rho0, self.tlist[0])
+        solver_query = MESolver(
+            self.H, c_ops=self.c_ops, options=options
+        )
+        solver_query.start(self.rho0, self.tlist[0])
+
+        for t in self.tlist[1:]:
+            ref_state = solver_ref.step(t).full()
+            query_state = solver_query.step(t).full()
+            np.testing.assert_allclose(
+                query_state, ref_state, rtol=0, atol=0
+            )
+            solver_query.query(t - 0.027)
+
+        np.testing.assert_allclose(
+            solver_query.step(2.2).full(),
+            solver_ref.step(2.2).full(),
+            rtol=0, atol=0,
+        )
+
+    def test_query_without_option_raises(self, method):
+        result = mesolve(
+            self.H, self.rho0, self.tlist, c_ops=self.c_ops,
+            options={"method": method, "progress_bar": None},
+        )
+        with pytest.raises(RuntimeError):
+            result.query(0.5)
+
+    def test_query_outside_tlist_raises(self, method):
+        solver = MESolver(
+            self.H, c_ops=self.c_ops, options=self._options(method)
+        )
+        result = solver.run(self.rho0, self.tlist)
+        with pytest.raises(ValueError):
+            result.query(self.tlist[0] - 0.1)
+        with pytest.raises(ValueError):
+            result.query(self.tlist[-1] + 0.1)

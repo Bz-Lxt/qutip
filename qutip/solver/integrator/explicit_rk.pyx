@@ -13,6 +13,7 @@ from qutip.core.data.ode cimport cy_wrmn_error
 from qutip.solver.integrator._rhs cimport RHS
 from cpython.exc cimport PyErr_CheckSignals
 cimport cython
+import bisect
 import numpy as np
 
 
@@ -86,6 +87,13 @@ cdef class Explicit_RungeKutta:
             integrate up to ``t=3`` and then use interpolation to get the state
             at ``t=2``. With ``interpolate=False``, it will integrate to
             ``t=2``.
+
+    store_dense_output : bool
+        Whether to record the dense-output polynomial of every accepted
+        integration step. When enabled, ``dense_interpolate`` can recover the
+        state at any time covered by the whole evolution without evolving the
+        system again. Requires the Butcher tableau to provide dense output
+        coefficients (``bi``) and ``interpolate=True``.
     """
     def __init__(
             self,
@@ -98,6 +106,7 @@ cdef class Explicit_RungeKutta:
             double min_step=0,
             double max_step=0,
             bint interpolate=True,
+            bint store_dense_output=False,
         ):
         # Function to integrate.
         if not isinstance(deriv, RHS):
@@ -118,6 +127,11 @@ cdef class Explicit_RungeKutta:
         # If True, will do the steps longer that the target and use
         # interpolation to get the state at the wanted time.
         self.interpolate = interpolate
+        # If True, keep the dense-output polynomial of every accepted step.
+        self.store_dense_output = store_dense_output
+        # Recorded dense-output history, filled during the integration.
+        self.dense_steps = []
+        self._dense_t0 = []
 
         self.k = []
         self._init_coeff(**butcher_tableau)
@@ -174,6 +188,11 @@ cdef class Explicit_RungeKutta:
                              f"{self.rk_step}")
 
         self.interpolate = bi is not None and self.interpolate
+        if self.store_dense_output and not self.interpolate:
+            raise ValueError(
+                "`store_dense_output` requires dense output coefficients "
+                "(`bi` in the Butcher tableau) and `interpolate=True`."
+            )
         if self.interpolate:
             self.denseout_order = bi.shape[1]
             if bi.shape[0] != self.rk_extra_step:
@@ -199,6 +218,7 @@ cdef class Explicit_RungeKutta:
             self.deriv, self.butcher_tableau,
             self.rtol, self.atol, self.max_numsteps, self.first_step,
             self.min_step, self.max_step, self.interpolate,
+            self.store_dense_output,
         ))
 
     cpdef void set_initial_value(self, Data y0, double t) except *:
@@ -210,6 +230,10 @@ cdef class Explicit_RungeKutta:
         self._t_front = t
         self._dt_int = 0
         self._y = y0
+
+        # Discard any dense-output history recorded for a previous run.
+        self.dense_steps = []
+        self._dense_t0 = []
 
         #prepare the buffers
         self.k = []
@@ -314,6 +338,12 @@ cdef class Explicit_RungeKutta:
             self._t_prev = self._t_front
             nsteps_left -= self._step_in_err(t, nsteps_left)
             PyErr_CheckSignals()
+            if self.store_dense_output and self._status >= 0:
+                # Compute the extra stages and snapshot the dense-output
+                # polynomial of this accepted step before any later step
+                # overwrites the ``k`` buffers.
+                self._prep_dense_out()
+                self._record_dense_step()
             if step:
                 break
 
@@ -329,6 +359,75 @@ cdef class Explicit_RungeKutta:
             self._status = Status.AT_FRONT
             self._t = self._t_front
             self._y = copy_to(self._y_front, self._y)
+
+    cpdef Data interpolate_state(Explicit_RungeKutta self, double t):
+        """
+        Compute the state at time ``t`` within the current integration step
+        using the method's dense output.
+
+        Unlike :meth:`integrate`, this never modifies ``_t``, ``_y`` or the
+        integration status, so calling it does not perturb the continuous
+        progression of subsequent steps. The returned state is a fresh copy.
+        """
+        cdef Data out
+        if not self.interpolate:
+            raise ValueError(
+                "This integrator does not provide dense output: enable the "
+                "`interpolate` option and use a Butcher tableau with `bi` "
+                "coefficients."
+            )
+        if self._y_prev is None:
+            raise ValueError("The integrator has not been initialised.")
+        if t < self._t_prev or t > self._t_front:
+            raise ValueError(
+                f"`t`={t} is outside the current integration step range "
+                f"[{self._t_prev}, {self._t_front}]."
+            )
+        if t == self._t_prev:
+            return self._y_prev.copy()
+        if t == self._t_front:
+            return self._y_front.copy()
+        if self._status != Status.INTERPOLATED:
+            # Only fills the extra dense-output stages and scratch buffers;
+            # the state, time and status used by the integration are left
+            # untouched.
+            self._prep_dense_out()
+        out = self._y_prev.copy()
+        return self._interpolate_step(t, out)
+
+    cpdef Data dense_interpolate(Explicit_RungeKutta self, double t):
+        """
+        Compute the state at time ``t`` from the dense-output polynomials
+        recorded for every accepted step (see ``store_dense_output``).
+
+        The query only reads the recorded history and never evolves the
+        system or modifies the integration state, hence it does not affect
+        subsequent :meth:`integrate` calls. The returned state is a fresh
+        copy.
+        """
+        cdef:
+            int idx
+            double t0, dt, t_end
+        if not self.store_dense_output or not self.dense_steps:
+            raise ValueError(
+                "No dense-output history is available. Set "
+                "`store_dense_output=True` before integrating."
+            )
+        idx = bisect.bisect_right(self._dense_t0, t) - 1
+        if idx < 0:
+            raise ValueError(
+                f"`t`={t} is before the recorded integration interval "
+                f"starting at {self._dense_t0[0]}."
+            )
+        t0 = self.dense_steps[idx][0]
+        dt = self.dense_steps[idx][1]
+        t_end = t0 + dt
+        if t > t_end:
+            raise ValueError(
+                f"`t`={t} is after the recorded integration interval "
+                f"ending at {t_end}."
+            )
+        return self._eval_dense(self.dense_steps[idx], t)
 
     cdef int _step_in_err(self, double t, int max_step) except -1:
         """
@@ -428,6 +527,68 @@ cdef class Explicit_RungeKutta:
         out = copy_to(self._y_prev, out)
         out = self._accumulate(out, self.b_factor, dt, self.rk_extra_step)
         return out
+
+    cdef void _record_dense_step(self) except *:
+        """
+        Snapshot the dense-output polynomial of the last accepted step.
+
+        The dense output of a step starting at ``(_t_prev, _y_prev)`` with
+        length ``_dt_int`` is::
+
+            y(t0 + tau * dt) = y_prev + tau * (Q_0 + tau * (Q_1 + ...))
+
+        with ``Q_j = dt * sum_i bi[i, j] * k_i``. The ``Q_j`` are stored
+        explicitly so that the step can be evaluated later without keeping
+        (or recomputing) any of the ``k`` stages.
+        """
+        cdef:
+            int i, j
+            double dt = self._dt_int
+            list coeffs = []
+            Data q
+        for j in range(self.denseout_order):
+            q = None
+            for i in range(self.rk_extra_step):
+                if self.bi[i, j] != 0.:
+                    if q is None:
+                        q = imul_data(
+                            <Data> self.k[i].copy(), dt * self.bi[i, j]
+                        )
+                    else:
+                        q = iadd_data(q, <Data> self.k[i],
+                                      dt * self.bi[i, j])
+            if q is None:
+                # A whole zero column of `bi`: store an explicit zero state.
+                q = imul_data(<Data> self._y_prev.copy(), 0.)
+            coeffs.append(q)
+        self.dense_steps.append(
+            (self._t_prev, dt, self._y_prev.copy(), coeffs)
+        )
+        self._dense_t0.append(self._t_prev)
+
+    cdef Data _eval_dense(self, tuple record, double t):
+        """
+        Evaluate a recorded dense-output polynomial (see
+        :meth:`_record_dense_step`) at time ``t``.
+        """
+        cdef:
+            double t0 = record[0]
+            double dt = record[1]
+            Data y0 = <Data> record[2]
+            list coeffs = record[3]
+            int p = self.denseout_order
+            int j
+            double tau = (t - t0) / dt
+            Data acc
+        # Horner evaluation of Q_0 + tau * (Q_1 + tau * (... + tau * Q_p-1)).
+        acc = (<Data> coeffs[p - 1]).copy()
+        for j in range(p - 2, -1, -1):
+            acc = imul_data(acc, tau)
+            acc = iadd_data(acc, <Data> coeffs[j], 1.)
+        # y(t) = y_prev + tau * acc
+        acc = imul_data(acc, tau)
+        acc = iadd_data(acc, y0, 1.)
+        return acc
 
     cdef inline Data _accumulate(self, Data target, double[:] factors,
                          double dt, int size):

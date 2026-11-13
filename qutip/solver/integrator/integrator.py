@@ -194,6 +194,78 @@ class Integrator:
         """
         raise NotImplementedError
 
+    def interpolate(
+        self, t: float, copy: bool = True
+    ) -> tuple[float, Data]:
+        """
+        Return the state at time ``t`` using the integrator's dense output
+        for the step currently held in memory.
+
+        The query does not evolve the system and must not modify the
+        integrator's internal state, so subsequent :meth:`integrate` and
+        :meth:`mcstep` calls continue exactly as if the query had not
+        happened.
+
+        Parameters
+        ----------
+        t : float
+            Time at which to recover the state. It must lie within the
+            integration step currently held by the integrator.
+
+        copy : bool, default: True
+            Whether to return a copy of the state or the state itself.
+
+        Returns
+        -------
+        (t, state) : (float, qutip.Data)
+            The interpolated state of the solver at ``t``.
+
+        .. note:
+            Only integrators providing dense output support this method;
+            the default implementation raises an :class:`IntegratorException`.
+        """
+        raise IntegratorException(
+            f"The {self.name or self.__class__.__name__} integrator does not "
+            "support dense output interpolation."
+        )
+
+    def dense_interpolate(
+        self, t: float, copy: bool = True
+    ) -> tuple[float, Data]:
+        """
+        Return the state at time ``t`` from the dense-output history
+        recorded while integrating.
+
+        Unlike :meth:`interpolate`, this can recover the state at any time
+        covered by the whole recorded evolution, not only within the current
+        step. It never evolves the system nor alters the integrator's
+        internal state. Recording must typically be enabled explicitly
+        (e.g. through the ``store_dense_output`` option).
+
+        Parameters
+        ----------
+        t : float
+            Time at which to recover the state. It must lie within the time
+            interval covered by the recorded evolution.
+
+        copy : bool, default: True
+            Whether to return a copy of the state or the state itself.
+
+        Returns
+        -------
+        (t, state) : (float, qutip.Data)
+            The interpolated state of the solver at ``t``.
+
+        .. note:
+            Only integrators providing recorded dense output support this
+            method; the default implementation raises an
+            :class:`IntegratorException`.
+        """
+        raise IntegratorException(
+            f"The {self.name or self.__class__.__name__} integrator does not "
+            "support recorded dense output."
+        )
+
     def run(self, tlist: list[float]) -> Iterator[tuple[float, Data]]:
         """
         Integrate the system yielding the state for each times in tlist.

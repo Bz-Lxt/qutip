@@ -5,6 +5,7 @@ import numpy as np
 from qutip.solver.sesolve import sesolve, SESolver
 from qutip.solver.krylovsolve import krylovsolve
 from qutip.solver.solver_base import Solver
+from qutip.solver.integrator import IntegratorException
 
 # Deactivate warning for test without cython
 from qutip.core.coefficient import WARN_MISSING_MODULE
@@ -338,3 +339,149 @@ def test_feedback():
     solver = qutip.SESolver(H)
     result = solver.run(psi0, np.linspace(0, 30, 301), e_ops=[qutip.num(N)])
     assert np.all(result.expect[0] > 2 - tol)
+
+
+@pytest.mark.parametrize("method", ["vern7", "vern9", "tsit5"])
+class TestSESolverDenseOutput:
+    H = 0.2 * np.pi * qutip.sigmaz() + np.pi * qutip.sigmax()
+    psi0 = qutip.basis(2, 0)
+    e_ops = [qutip.sigmax(), qutip.sigmaz()]
+    tlist = np.linspace(0, 2, 7)
+    query_times = [0.137, 0.582, 1.236, 1.841]
+
+    def _options(self, method):
+        return {
+            "method": method,
+            "store_dense_output": True,
+            "atol": 1e-11,
+            "rtol": 1e-11,
+            "progress_bar": None,
+        }
+
+    def test_query_matches_inserted_tlist(self, method):
+        solver = SESolver(self.H, options=self._options(method))
+        result = solver.run(self.psi0, self.tlist, e_ops=self.e_ops)
+
+        for t in self.query_times:
+            state, expect = result.query(t)
+
+            direct = sesolve(
+                self.H, self.psi0, sorted([*self.tlist, t]),
+                e_ops=self.e_ops,
+                options={
+                    "method": method, "atol": 1e-11, "rtol": 1e-11,
+                    "store_states": True, "progress_bar": None,
+                },
+            )
+            idx = list(direct.times).index(t)
+            np.testing.assert_allclose(
+                state.full(), direct.states[idx].full(), atol=1e-12, rtol=0
+            )
+            for i, e_op in enumerate(self.e_ops):
+                np.testing.assert_allclose(
+                    expect[i], direct.expect[i][idx], atol=1e-12, rtol=0
+                )
+
+    def test_query_without_e_ops_returns_state(self, method):
+        solver = SESolver(self.H, options=self._options(method))
+        result = solver.run(self.psi0, self.tlist)
+        state = result.query(0.42)
+        assert isinstance(state, qutip.Qobj)
+        assert state.dims == self.psi0.dims
+
+        direct = sesolve(
+            self.H, self.psi0, [0, 0.42],
+            options={"method": method, "atol": 1e-11, "rtol": 1e-11},
+        )
+        np.testing.assert_allclose(
+            state.full(), direct.states[-1].full(), atol=1e-12, rtol=0
+        )
+
+    def test_solver_query_matches_result_query(self, method):
+        solver = SESolver(self.H, options=self._options(method))
+        result = solver.run(self.psi0, self.tlist, e_ops=self.e_ops)
+        for t in self.query_times:
+            state_solver = solver.query(t)
+            state_result, _ = result.query(t)
+            np.testing.assert_allclose(
+                state_solver.full(), state_result.full(), rtol=0, atol=0
+            )
+
+    def test_query_does_not_affect_subsequent_step(self, method):
+        options = self._options(method)
+        solver_ref = SESolver(self.H, options=options)
+        solver_ref.start(self.psi0, self.tlist[0])
+        solver_query = SESolver(self.H, options=options)
+        solver_query.start(self.psi0, self.tlist[0])
+
+        for t in self.tlist[1:]:
+            ref_state = solver_ref.step(t).full()
+            query_state = solver_query.step(t).full()
+            np.testing.assert_allclose(
+                query_state, ref_state, rtol=0, atol=0
+            )
+            # Queries between steps must leave the evolution untouched.
+            solver_query.query(t - 0.031)
+
+        # And the next step beyond the original tlist is still identical.
+        np.testing.assert_allclose(
+            solver_query.step(2.3).full(),
+            solver_ref.step(2.3).full(),
+            rtol=0, atol=0,
+        )
+
+    def test_query_without_option_raises(self, method):
+        result = sesolve(
+            self.H, self.psi0, self.tlist,
+            options={"method": method, "progress_bar": None},
+        )
+        with pytest.raises(RuntimeError):
+            result.query(0.5)
+
+        solver = SESolver(
+            self.H, options={"method": method, "progress_bar": None}
+        )
+        solver.start(self.psi0, self.tlist[0])
+        solver.step(self.tlist[1])
+        # RK integrator without recorded dense output raises ValueError.
+        with pytest.raises(ValueError):
+            solver.query(0.05)
+
+        # Integrators without any dense-output support raise
+        # IntegratorException instead.
+        solver_scipy = SESolver(
+            self.H, options={"method": "dop853", "progress_bar": None}
+        )
+        solver_scipy.start(self.psi0, self.tlist[0])
+        solver_scipy.step(self.tlist[1])
+        with pytest.raises(IntegratorException):
+            solver_scipy.query(0.05)
+
+    def test_query_outside_tlist_raises(self, method):
+        solver = SESolver(self.H, options=self._options(method))
+        result = solver.run(self.psi0, self.tlist)
+        with pytest.raises(ValueError):
+            result.query(self.tlist[0] - 0.1)
+        with pytest.raises(ValueError):
+            result.query(self.tlist[-1] + 0.1)
+
+    def test_query_at_tlist_points(self, method):
+        solver = SESolver(self.H, options=self._options(method))
+        result = solver.run(self.psi0, self.tlist, e_ops=self.e_ops)
+        direct = sesolve(
+            self.H, self.psi0, self.tlist,
+            e_ops=self.e_ops,
+            options={
+                "method": method, "atol": 1e-11, "rtol": 1e-11,
+                "store_states": True, "progress_bar": None,
+            },
+        )
+        for i, t in enumerate(self.tlist):
+            state, expect = result.query(t)
+            np.testing.assert_allclose(
+                state.full(), direct.states[i].full(), atol=1e-12, rtol=0
+            )
+            for k in range(len(self.e_ops)):
+                np.testing.assert_allclose(
+                    expect[k], direct.expect[k][i], atol=1e-12, rtol=0
+                )

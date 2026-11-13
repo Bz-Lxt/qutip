@@ -26,6 +26,15 @@ cdef class Explicit_RungeKutta:
     cdef readonly double rtol, atol, first_step, min_step, max_step
     cdef readonly int max_numsteps
     cdef readonly bint interpolate
+    # Whether the dense-output polynomial of every accepted step is kept
+    # so that ``dense_interpolate`` can query the whole evolved interval.
+    cdef readonly bint store_dense_output
+    # Recorded dense-output polynomials, one tuple per accepted step:
+    # (t0, dt, y_at_t0, [Q_0, ..., Q_{denseout_order - 1}]) with
+    # y(t0 + tau * dt) = y_at_t0 + tau * (Q_0 + tau * (Q_1 + ... )) and
+    # Q_j = dt * sum_i bi[i, j] * k_i.
+    cdef list dense_steps
+    cdef list _dense_t0
 
     # Runge Kutta tableau and info
     cdef int rk_step, rk_extra_step, order, denseout_order
@@ -46,6 +55,10 @@ cdef class Explicit_RungeKutta:
 
     cpdef void integrate(Explicit_RungeKutta self, double t, bint step=*) except *
 
+    cpdef Data interpolate_state(Explicit_RungeKutta self, double t)
+
+    cpdef Data dense_interpolate(Explicit_RungeKutta self, double t)
+
     cpdef void set_initial_value(self, Data y0, double t) except *
 
     cdef int _step_in_err(self, double t, int max_step) except -1
@@ -57,6 +70,10 @@ cdef class Explicit_RungeKutta:
     cdef void _prep_dense_out(self) except *
 
     cdef Data _interpolate_step(self, double t, Data out)
+
+    cdef void _record_dense_step(self) except *
+
+    cdef Data _eval_dense(self, tuple record, double t)
 
     cdef inline Data _accumulate(self, Data target, double[:] factors,
                                  double dt, int size)

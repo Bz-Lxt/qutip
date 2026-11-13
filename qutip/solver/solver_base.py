@@ -220,6 +220,12 @@ class Solver:
             results.add(t, self._restore_state(state, copy=False))
         progress_bar.finished()
 
+        if self._integrator.options.get("store_dense_output", False):
+            # Let the result query arbitrary in-between times using the
+            # recorded dense output. This intentionally keeps a reference to
+            # the solver while dense output is enabled.
+            results.attach_dense_query(self.query)
+
         stats['run time'] = progress_bar.total_time()
         # TODO: It would be nice if integrator could give evolution statistics
         # stats.update(_integrator.stats)
@@ -278,6 +284,43 @@ class Solver:
         _, state = self._integrator.integrate(t, copy=False)
         self.stats["run time"] += time() - _time_start
         return self._restore_state(state, copy=copy)
+
+    def query(self, t: Number) -> Qobj:
+        """
+        Recover the state at an arbitrary time within the already evolved
+        interval using the integrator's recorded dense output.
+
+        The state is obtained by evaluating the dense-output polynomial
+        stored by the integrator: no additional evolution is performed and
+        the integrator's internal state is left untouched. Consequently,
+        subsequent :meth:`step` (or :meth:`start` followed by :meth:`step`)
+        calls continue exactly as if the query had not happened, and the
+        returned state is identical to what would have been stored had
+        ``t`` been included in the original ``tlist``.
+
+        Parameters
+        ----------
+        t : double
+            Time at which to recover the state. It must lie within the time
+            interval covered by the evolution recorded so far.
+
+        Returns
+        -------
+        state : :obj:`.Qobj`
+            The state of the system at time ``t``.
+
+        Raises
+        ------
+        RuntimeError
+            If the integrator has not been initialised or dense output was
+            not recorded. Dense output recording is enabled through the
+            ``store_dense_output`` option and is supported by the
+            ``"vern7"``, ``"vern9"`` and ``"tsit5"`` integrators.
+        """
+        if not self._integrator._is_set:
+            raise RuntimeError("The `start` method must called first")
+        _, data = self._integrator.dense_interpolate(t, copy=False)
+        return self._restore_state(data, copy=False)
 
     def _get_integrator(self):
         """ Return the initialted integrator. """
